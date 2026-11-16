@@ -36,5 +36,5 @@ dependencies:
       - easydict==1.9
       - cloudpickle==2.1.0
       - gym==0.25.2
-      - mujoco
+      - mujoco==2.3.7  # robosuite 1.4 breaks on mujoco 3.x (get_joint_qpos_addr assertion)
       - flash-attn==2.5.5

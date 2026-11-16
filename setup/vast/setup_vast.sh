@@ -14,7 +14,8 @@ echo "=== [1/5] System packages (headless rendering for MuJoCo) ==="
 export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update -y
 $SUDO apt-get install -y --no-install-recommends \
-  libegl1 libgl1 libosmesa6 libglew-dev libglib2.0-0 ffmpeg git wget tmux
+  libegl1 libgl1 libosmesa6 libglew-dev libglib2.0-0 ffmpeg git wget tmux \
+  build-essential libegl-dev libgl-dev
 
 echo "=== [2/5] Miniconda ==="
 if [ ! -x "$CONDA_DIR/bin/conda" ]; then
@@ -28,16 +29,31 @@ conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/ma
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
 
 echo "=== [3/5] Conda env '$ENV_NAME' (without flash-attn: compiling it can take >1h; the code falls back to sdpa) ==="
-if ! conda env list | grep -qE "^$ENV_NAME\s"; then
-  sed '/flash-attn/d' setup/openvla/environment.openvla.yml > /tmp/environment.openvla.noflash.yml
+# CMake 4.x refuses old CMakeLists (egl_probe, a LIBERO/robomimic dependency); this keeps them buildable.
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+sed '/flash-attn/d' setup/openvla/environment.openvla.yml > /tmp/environment.openvla.noflash.yml
+if conda env list | grep -qE "^$ENV_NAME\s"; then
+  # Env exists (possibly from a run whose pip step failed): make sure every package is actually installed.
+  conda env update -n "$ENV_NAME" -f /tmp/environment.openvla.noflash.yml
+else
   conda env create -f /tmp/environment.openvla.noflash.yml
 fi
-conda activate "$ENV_NAME"
+set +u; conda activate "$ENV_NAME"; set -u  # conda activate.d scripts are not nounset-safe
 pip install -e .
-if ! python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('libero.libero') else 1)"; then
-  echo "pip 'libero' is not the LIBERO benchmark -> installing LIBERO from GitHub"
-  pip install "git+https://github.com/Lifelong-Robot-Learning/LIBERO.git"
+# Same editable-install issue as LIBERO below: put src/ on sys.path explicitly.
+echo "$REPO_ROOT/src" > "$(python -c 'import site; print(site.getsitepackages()[0])')/vla_mech_interp_src.pth"
+if ! python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('libero.libero') else 1)" 2>/dev/null; then
+  # LIBERO must be installed editable from a clone: its top-level package has no __init__.py and its
+  # bddl/init-state files are not package data, so a plain `pip install git+...` produces an unusable install.
+  LIBERO_DIR="${LIBERO_DIR:-$(dirname "$REPO_ROOT")/LIBERO}"
+  echo "Installing LIBERO (editable) into $LIBERO_DIR"
+  [ -d "$LIBERO_DIR/.git" ] || git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git "$LIBERO_DIR"
+  pip install -e "$LIBERO_DIR"
+  # Modern pip's editable finder skips `libero` (namespace package): put the clone on sys.path via a .pth file.
+  echo "$LIBERO_DIR" > "$(python -c 'import site; print(site.getsitepackages()[0])')/libero_repo.pth"
 fi
+python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('libero.libero') else 1)" \
+  || { echo "ERROR: LIBERO is still not importable"; exit 1; }
 
 echo "=== [4/5] LIBERO config + assets ==="
 bash setup/openvla/setup.sh

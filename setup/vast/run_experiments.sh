@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../.. && pwd)"
 CONDA_DIR="${CONDA_DIR:-$HOME/miniconda3}"
 # shellcheck disable=SC1091
 source "$CONDA_DIR/etc/profile.d/conda.sh"
-conda activate openvla-interp
+set +u; conda activate openvla-interp; set -u  # conda activate.d scripts are not nounset-safe
 
 cd "$REPO_ROOT/openvla"
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
