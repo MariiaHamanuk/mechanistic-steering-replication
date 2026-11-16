@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -24,6 +24,7 @@ class EnvConfig:
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
     seed: int = 7
+    max_tasks: Optional[int] = None  # run only the first N tasks of the suite (cheap smoke tests)
 
 
 @dataclass
@@ -38,6 +39,7 @@ class LoggingConfig:
     root_dir: str = "logs"
     save_video: bool = True
     save_actions: bool = True
+    measure_norms: bool = True  # log ||alpha v|| / ||x|| for intervention runs
 
 
 @dataclass

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import tqdm
 from libero.libero import benchmark
 
 from libero_experiments.config import RunConfig
-from libero_experiments.hooks import apply_gate_proj_hooks
+from libero_experiments.experiment_log import EpisodeTracker, ExperimentLogger, command_string
+from libero_experiments.hooks import InterventionNormStats, apply_gate_proj_hooks
 from libero_experiments.interventions import load_intervention_dict
 from libero_experiments.libero_utils import (
     get_libero_dummy_action,
@@ -44,7 +46,16 @@ class EvalResult:
     success_rate: float
 
 
-def eval_libero(cfg: RunConfig, intervention_config_path: str) -> EvalResult:
+MAX_STEPS = {
+    "libero_spatial": 220,
+    "libero_object": 280,
+    "libero_goal": 300,
+    "libero_10": 520,
+    "libero_90": 400,
+}
+
+
+def eval_libero(cfg: RunConfig, intervention_config_path: str, meta: Optional[Dict[str, Any]] = None) -> EvalResult:
     set_seed_everywhere(cfg.env.seed)
     cfg_unnorm_key = cfg.env.task_suite_name
 
@@ -68,14 +79,38 @@ def eval_libero(cfg: RunConfig, intervention_config_path: str) -> EvalResult:
     print(f"Logging to local log file: {log_path}")
     log_file.write(f"Logging to local log file: {log_path}\n")
 
+    norm_stats = None
+    intervention_dict = {}
     if cfg.intervention.enabled:
         intervention_dict = load_intervention_dict(cfg.intervention.dict_name, intervention_config_path)
-        hooks = apply_gate_proj_hooks(model, intervention_dict, coef=cfg.intervention.coef)
+        norm_stats = InterventionNormStats() if cfg.logging.measure_norms else None
+        hooks = apply_gate_proj_hooks(model, intervention_dict, coef=cfg.intervention.coef, norm_stats=norm_stats)
         log_file.write(f"Intervention dict: {cfg.intervention.dict_name}\n")
         log_file.write(f"Intervention coef: {cfg.intervention.coef}\n")
     else:
         hooks = []
 
+    # Structured experiment log (mirrors the Google Sheet). Finalized even if the run crashes or is interrupted.
+    exp_logger = ExperimentLogger(cfg, run_dir, run_id, meta or {}, command_string(), intervention_dict)
+    status, error_msg = "interrupted", None
+    try:
+        result = _run_episodes(cfg, model, processor, cfg_unnorm_key, run_dir, log_file, exp_logger)
+        status = "completed"
+        return result
+    except KeyboardInterrupt:
+        status, error_msg = "interrupted", "Ctrl+C"
+        raise
+    except Exception as exc:
+        status, error_msg = "failed", f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        for hook in hooks:
+            hook.remove()
+        log_file.close()
+        exp_logger.finalize(status, norm_stats.summary() if norm_stats else None, error_msg)
+
+
+def _run_episodes(cfg, model, processor, cfg_unnorm_key, run_dir, log_file, exp_logger) -> EvalResult:
     csv_path = os.path.join(run_dir, "events.csv")
     write_csv_header(csv_path)
 
@@ -85,10 +120,16 @@ def eval_libero(cfg: RunConfig, intervention_config_path: str) -> EvalResult:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.env.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
+    if cfg.env.max_tasks:
+        num_tasks_in_suite = min(num_tasks_in_suite, cfg.env.max_tasks)
+    exp_logger.set_plan(num_tasks_in_suite, cfg.env.num_trials_per_task)
     print(f"Task suite: {cfg.env.task_suite_name}")
     log_file.write(f"Task suite: {cfg.env.task_suite_name}\n")
 
     resize_size = get_resize_size(cfg.model.family)
+    if cfg.env.task_suite_name not in MAX_STEPS:
+        raise ValueError("Unexpected task suite")
+    max_steps = MAX_STEPS[cfg.env.task_suite_name]
 
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
@@ -104,19 +145,9 @@ def eval_libero(cfg: RunConfig, intervention_config_path: str) -> EvalResult:
             obs = env.set_init_state(initial_states[episode_idx])
 
             t = 0
+            done = False
             replay_images = []
-            if cfg.env.task_suite_name == "libero_spatial":
-                max_steps = 220
-            elif cfg.env.task_suite_name == "libero_object":
-                max_steps = 280
-            elif cfg.env.task_suite_name == "libero_goal":
-                max_steps = 300
-            elif cfg.env.task_suite_name == "libero_10":
-                max_steps = 520
-            elif cfg.env.task_suite_name == "libero_90":
-                max_steps = 400
-            else:
-                raise ValueError("Unexpected task suite")
+            tracker = EpisodeTracker(task_id, task_description, episode_idx, max_steps)
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
@@ -140,6 +171,7 @@ def eval_libero(cfg: RunConfig, intervention_config_path: str) -> EvalResult:
                         ),
                     }
 
+                    t_infer = time.perf_counter()
                     action = get_action(
                         model,
                         processor,
@@ -148,11 +180,13 @@ def eval_libero(cfg: RunConfig, intervention_config_path: str) -> EvalResult:
                         task_description,
                         unnorm_key=cfg_unnorm_key,
                     )
+                    infer_s = time.perf_counter() - t_infer
 
                     action = normalize_gripper_action(action, binarize=True)
                     if cfg.model.family == "openvla":
                         action = invert_gripper_action(action)
 
+                    tracker.add_step(obs["robot0_eef_pos"], action, infer_s)
                     obs, reward, done, info = env.step(action.tolist())
                     current_episode_actions.append(action.tolist())
 
@@ -165,10 +199,12 @@ def eval_libero(cfg: RunConfig, intervention_config_path: str) -> EvalResult:
                 except Exception as exc:
                     print(f"Caught exception: {exc}")
                     log_file.write(f"Caught exception: {exc}\n")
+                    tracker.error = f"{type(exc).__name__}: {exc}"
                     break
 
             task_episodes += 1
             total_episodes += 1
+            exp_logger.log_episode(tracker.finish(done, obs.get("robot0_eef_pos"), exp_logger.concept))
 
             if task_description not in all_actions_by_task:
                 all_actions_by_task[task_description] = {}
@@ -206,8 +242,4 @@ def eval_libero(cfg: RunConfig, intervention_config_path: str) -> EvalResult:
     if cfg.logging.save_actions:
         save_actions_json(actions_path, all_actions_by_task)
 
-    for hook in hooks:
-        hook.remove()
-
-    log_file.close()
     return EvalResult(run_dir=run_dir, success_rate=float(total_successes) / float(total_episodes))
