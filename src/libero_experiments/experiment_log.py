@@ -15,6 +15,7 @@ and regenerates, in the logs root, a combined table of all runs:
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import math
 import os
@@ -155,14 +156,17 @@ def git_info() -> Dict[str, Any]:
 
 def package_versions() -> Dict[str, str]:
     out = {"python": platform.python_version()}
-    try:
-        import torch
+    if "torch" in sys.modules or importlib.util.find_spec("torch") is not None:
+        try:
+            import torch
 
-        out["torch"] = torch.__version__
-        out["cuda"] = torch.version.cuda or "cpu"
-    except Exception:
-        pass
-    for pkg in ["transformers", "tokenizers", "timm", "flash-attn", "robosuite", "mujoco", "libero", "lerobot"]:
+            out["torch"] = torch.__version__
+            out["cuda"] = torch.version.cuda or "cpu"
+        except Exception:
+            pass
+    pkgs = ["transformers", "tokenizers", "timm", "flash-attn", "robosuite", "mujoco", "libero", "lerobot",
+            "jax", "jaxlib", "flax"]
+    for pkg in pkgs:
         try:
             out[pkg] = metadata.version(pkg)
         except metadata.PackageNotFoundError:
@@ -175,17 +179,24 @@ def package_versions() -> Dict[str, str]:
 
 def hardware_info() -> Dict[str, Any]:
     info: Dict[str, Any] = {"hostname": socket.gethostname()}
-    try:
-        import torch
+    # nvidia-smi first: works in any env (the JAX env has a CPU-only torch).
+    smi = _run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+    if smi:
+        gpus = [line.split(",") for line in smi.splitlines() if line.strip()]
+        name, mem_mb = gpus[0][0].strip(), float(gpus[0][1])
+        info["gpu"] = f"{name}, {mem_mb / 1024:.0f} GB, x{len(gpus)}"
+    else:
+        try:
+            import torch
 
-        if torch.cuda.is_available():
-            n = torch.cuda.device_count()
-            props = torch.cuda.get_device_properties(0)
-            info["gpu"] = f"{props.name}, {props.total_memory / 1024**3:.0f} GB, x{n}"
-        else:
-            info["gpu"] = "CPU only"
-    except Exception:
-        info["gpu"] = "unknown"
+            if torch.cuda.is_available():
+                n = torch.cuda.device_count()
+                props = torch.cuda.get_device_properties(0)
+                info["gpu"] = f"{props.name}, {props.total_memory / 1024**3:.0f} GB, x{n}"
+            else:
+                info["gpu"] = "CPU only"
+        except Exception:
+            info["gpu"] = "unknown"
 
     cpu_model = platform.processor() or ""
     try:
@@ -649,6 +660,20 @@ def rebuild_combined_table(logs_root: Path) -> Optional[Path]:
     out = Path(logs_root) / "experiments_table"
     _write_table(out, [s["row"] for s in summaries])
     return out.with_suffix(".tsv")
+
+
+def write_run_outputs(run_dir: Path, summary: Dict[str, Any]) -> None:
+    """For runs that build their own row (e.g. pi0): write summary.json + sheet_row.* and refresh the combined table.
+
+    `summary` must contain "row" (dict keyed by COLUMN_KEYS), "run_id", "status" and "start" (ISO time).
+    """
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    row = {k: str(summary["row"].get(k, "") if summary["row"].get(k) is not None else "") for k in COLUMN_KEYS}
+    summary = dict(summary, row=row)
+    (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    _write_table(run_dir / "sheet_row", [row])
+    rebuild_combined_table(run_dir.parent)
 
 
 def build_meta(args: Any) -> Dict[str, Any]:

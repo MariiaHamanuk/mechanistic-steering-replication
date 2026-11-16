@@ -26,6 +26,8 @@ def parse_overrides(pairs: list[str]) -> dict:
         key, raw = pair.split("=", 1)
         if raw.lower() in {"true", "false"}:
             value: Any = raw.lower() == "true"
+        elif raw.lower() in {"null", "none"}:
+            value = None
         else:
             try:
                 value = int(raw)
