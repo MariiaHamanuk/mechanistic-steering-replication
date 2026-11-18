@@ -335,6 +335,23 @@ def restore_params(
             maybe_future.result()
         handler.close()
 
+    # The checkpoints now served from gs://openpi-assets record a SingleDeviceSharding on TFRT_CPU_0. Reading the
+    # metadata on a GPU host then fails ("not found in jax.local_devices()"). The saved sharding is irrelevant
+    # because we pass our own sharding in restore_args, so treat an unknown device as "no sharding info".
+    from orbax.checkpoint import type_handlers as _ocp_th
+
+    if not getattr(_ocp_th, "_openpi_lenient_sharding", False):
+        _orig_deser = _ocp_th._deserialize_sharding_from_json_string  # noqa: SLF001
+
+        def _lenient_deser(*args, **kwargs):
+            try:
+                return _orig_deser(*args, **kwargs)
+            except ValueError:
+                return None
+
+        _ocp_th._deserialize_sharding_from_json_string = _lenient_deser  # noqa: SLF001
+        _ocp_th._openpi_lenient_sharding = True  # noqa: SLF001
+
     ckptr = ocp.PyTreeCheckpointer()
     metadata = ckptr.metadata(params_path)
     if isinstance(metadata, dict):

@@ -13,10 +13,10 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../.. && pwd)"
-CONDA_DIR="${CONDA_DIR:-$HOME/miniconda3}"
 # shellcheck disable=SC1091
-source "$CONDA_DIR/etc/profile.d/conda.sh"
-set +u; conda activate openpi-interp; set -u  # conda activate.d scripts are not nounset-safe
+source "$REPO_ROOT/setup/vast/_conda_env.sh"
+load_conda
+activate_env openpi-interp || exit 1
 
 cd "$REPO_ROOT"
 unset JAX_PLATFORM_NAME  # use the GPU

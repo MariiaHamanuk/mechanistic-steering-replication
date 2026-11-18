@@ -14,10 +14,10 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../.. && pwd)"
-CONDA_DIR="${CONDA_DIR:-$HOME/miniconda3}"
 # shellcheck disable=SC1091
-source "$CONDA_DIR/etc/profile.d/conda.sh"
-set +u; conda activate lerobot; set -u  # conda activate.d scripts are not nounset-safe
+source "$REPO_ROOT/setup/vast/_conda_env.sh"
+load_conda
+activate_env lerobot || exit 1
 cd "$REPO_ROOT"
 export MUJOCO_GL=egl
 
@@ -34,7 +34,7 @@ smoke() {
   echo ">>> SMOKE: 6 episodes, 48 frames, 2 layers in the sweep"
   python $S/collect.py --policy "$POLICY" --dataset "$DATASET" --n_episodes 6 --stride 10 --max_frames 48 --out "$d" \
     && python $S/probe.py --run "$d" --test_frac 0.34 \
-    && python $S/sweep.py --run "$d" --n_frames 8 --layers 0,9 --alphas -0.2,0.2 \
+    && python $S/sweep.py --run "$d" --n_frames 8 --layers 0,9 --alphas=-0.2,0.2 \
     && echo ">>> SMOKE OK (numbers are meaningless at this size, it only checks the pipeline)"
 }
 collect() { python $S/collect.py --policy "$POLICY" --dataset "$DATASET" --n_episodes "$N_EPISODES" --stride "$STRIDE" --out "$LOGS/$RUN"; }

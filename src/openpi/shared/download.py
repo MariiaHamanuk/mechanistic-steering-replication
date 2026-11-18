@@ -56,6 +56,12 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
     Returns:
         Local path to the downloaded file or directory. That path is guaranteed to exist and is absolute.
     """
+    # The public OpenPI assets moved from S3 to Google Cloud Storage: s3://openpi-assets no longer exists
+    # (NoSuchBucket). Read the same paths from gs://openpi-assets anonymously (needs gcsfs).
+    if url.startswith("s3://openpi-assets/"):
+        url = "gs://" + url[len("s3://"):]
+        kwargs.setdefault("token", "anon")
+
     # Don't use fsspec to parse the url to avoid unnecessary connection to the remote filesystem.
     parsed = urllib.parse.urlparse(url)
 

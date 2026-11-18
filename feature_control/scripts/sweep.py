@@ -45,6 +45,12 @@ def main():
     p.add_argument("--ctrl_layer", type=int, default=-1, help="-1 = best observer layer for dz")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--dtype", default="", help="override model dtype (e.g. float32: small controller shifts can be "
+                                               "rounded away when added to large bf16 hidden states)")
+    p.add_argument("--skip_sweep", action="store_true", help="only run the controller check (B)")
+    p.add_argument("--tag", default="", help="suffix for the output files")
+    p.add_argument("--margin_sd", type=float, default=0.0,
+                   help="controller aims this many label-SDs inside the interval (0 = paper's minimal shift)")
     args = p.parse_args()
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -71,7 +77,8 @@ def main():
     lookup = {(int(e), int(f)): i for i, (e, f) in enumerate(zip(ds_ep, ds_fr))}
     items = [ds[lookup[(int(lab["episode_index"][r]), int(lab["frame_index"][r]))]] for r in rows]
 
-    policy, pre, post, cfg = load_policy(meta["policy"], dtype=meta["dtype"])
+    dtype = args.dtype or meta["dtype"]
+    policy, pre, post, cfg = load_policy(meta["policy"], dtype=dtype)
     batches = [pre(collate(items[i: i + args.batch])) for i in range(0, len(items), args.batch)]
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
     noises = [torch.randn((len(items[i: i + args.batch]), cfg.chunk_size, cfg.max_action_dim), generator=gen)
@@ -96,7 +103,7 @@ def main():
 
     # A) sweep
     sweep = {f: {} for f in sweep_feats}
-    for f in sweep_feats:
+    for f in ([] if args.skip_sweep else sweep_feats):
         dim = ACTION_DIM[f]
         for l in layers:
             row = {}
@@ -112,16 +119,19 @@ def main():
     # B) controller (dz)
     l = args.ctrl_layer if args.ctrl_layer >= 0 else res["best"]["dz"]["layer"]
     q10, q90 = np.percentile(lab["dz"], [10, 90])
-    ctrl = {"layer": l, "observer_R2": res["scores"]["dz"][l], "base_pred_dz_mean": float(base[:, 2].mean())}
+    margin = args.margin_sd * float(np.std(lab["dz"]))
+    tol = 1e-3 * float(np.std(lab["dz"]))  # landing exactly on the boundary counts as inside
+    ctrl = {"layer": l, "observer_R2": res["scores"]["dz"][l], "base_pred_dz_mean": float(base[:, 2].mean()),
+            "margin": margin}
     for name, lo, hi in [("dz_high", q90, np.inf), ("dz_low", -np.inf, q10)]:
-        s = Steer(probe("dz", l), mode="controller", xi_min=lo, xi_max=hi)
+        s = Steer(probe("dz", l), mode="controller", xi_min=lo, xi_max=hi, margin=margin)
         h = PrefixSteer(policy, [s])
         torch.cuda.synchronize()
         t1 = time.time()
         pred = predict()
         steer_ms = (time.time() - t1) / len(items) * 1000
         h.remove()
-        inside = lambda v: (v >= lo) & (v <= hi)  # noqa: E731
+        inside = lambda v: (v >= lo - tol) & (v <= hi + tol)  # noqa: E731
         ctrl[name] = {
             "interval": [None if not np.isfinite(lo) else float(lo), None if not np.isfinite(hi) else float(hi)],
             "observer_inside_before": float(inside(np.array(s.stats["xi_before"])).mean()),
@@ -137,9 +147,12 @@ def main():
               f"{ctrl[name]['pred_dz_inside_base']:.0%} -> {ctrl[name]['pred_dz_inside_steered']:.0%}; "
               f"mean dz {base[:, 2].mean():+.4f} -> {pred[:, 2].mean():+.4f}", flush=True)
 
-    out = {"n_frames": len(items), "alphas": alphas, "alpha_units": "fraction of ||x_l||",
+    out = {"n_frames": len(items), "alphas": alphas, "alpha_units": "fraction of ||x_l||", "dtype": dtype,
            "base_ms_per_frame": base_ms, "sweep": sweep, "controller": ctrl}
-    (run / "sweep_results.json").write_text(json.dumps(out, indent=2))
+    (run / f"sweep_results{args.tag}.json").write_text(json.dumps(out, indent=2))
+    if args.skip_sweep:
+        print(f"[sweep] DONE (controller only) -> {run / f'sweep_results{args.tag}.json'}")
+        return
 
     try:
         import matplotlib

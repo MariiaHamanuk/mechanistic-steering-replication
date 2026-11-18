@@ -5,7 +5,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../.. && pwd)"
 cd "$REPO_ROOT"
-CONDA_DIR="${CONDA_DIR:-$HOME/miniconda3}"
+# shellcheck disable=SC1091
+source "$REPO_ROOT/setup/vast/_conda_env.sh"
 ENV_NAME=openpi-interp
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
@@ -19,9 +20,7 @@ if [ ! -x "$CONDA_DIR/bin/conda" ]; then
   wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
   bash /tmp/miniconda.sh -b -p "$CONDA_DIR"
 fi
-export PATH="$CONDA_DIR/bin:$PATH"
-# shellcheck disable=SC1091
-source "$CONDA_DIR/etc/profile.d/conda.sh"
+load_conda
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
 
@@ -32,7 +31,12 @@ if conda env list | grep -qE "^$ENV_NAME\s"; then
 else
   conda env create -f setup/openpi/environment.openpi.yml
 fi
-set +u; conda activate "$ENV_NAME"; set -u  # conda activate.d scripts are not nounset-safe
+activate_env "$ENV_NAME"
+# Checkpoints now live on gs://openpi-assets -> gcsfs (matching fsspec). gcsfs drags in a newer
+# protobuf that tensorflow 2.16 rejects, so pin protobuf back afterwards.
+pip install "gcsfs==$(python -c 'import fsspec; print(fsspec.__version__)')"
+# tensorflow-metadata >=1.17 imports google.protobuf.runtime_version (protobuf >=5), which TF 2.16 cannot use.
+pip install protobuf==4.25.8 tensorflow-metadata==1.16.1
 pip install -e .
 # Modern pip's editable finder can miss packages under src/: put src/ on sys.path explicitly.
 echo "$REPO_ROOT/src" > "$(python -c 'import site; print(site.getsitepackages()[0])')/vla_mech_interp_src.pth"

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,22 +31,38 @@ sys.path.insert(0, str(_REPO / "src"))
 from feature_control.common import BINARY, CONTINUOUS  # noqa: E402
 
 
-def fit_layer(X, labels, train, test, features):
+def fit_layer(X, labels, train, test, features, scale=False):
     from sklearn.linear_model import LogisticRegressionCV, RidgeCV
     from sklearn.metrics import accuracy_score, r2_score
 
+    X = X.astype(np.float64)
     mu = X[train].mean(0)
-    sd = X[train].std(0) + 1e-6
+    # Default: centre only, fit in the raw representation space (as the paper's f(x) = W^T x + b).
+    # Per-dimension scaling gives huge raw weights on near-constant dimensions; the minimal-norm control
+    # shift then concentrates there and barely moves the policy.
+    sd = X[train].std(0) + 1e-6 if scale else np.ones(X.shape[1])
     Z = (X - mu) / sd
     res = {}
+    # All continuous targets in one RidgeCV fit (one SVD, alpha chosen per target by efficient LOO-CV).
+    cont = [f for f in features if f not in BINARY]
+    if cont:
+        Y = np.stack([labels[f] for f in cont], axis=1)
+        m = RidgeCV(alphas=np.logspace(-1, 5, 13), alpha_per_target=True).fit(Z[train], Y[train])
+        P = m.predict(Z[test])
+        for j, f in enumerate(cont):
+            w, b = m.coef_[j], float(m.intercept_[j])
+            res[f] = (float(r2_score(Y[test, j], P[:, j])), (w / sd),
+                      b - float(np.sum(w * mu / sd)))
     for f in features:
+        if f not in BINARY:
+            continue
         y = labels[f]
         if f in BINARY:
             if len(np.unique(y[train])) < 2 or len(np.unique(y[test])) < 2:
                 res[f] = None
                 continue
             try:
-                m = LogisticRegressionCV(Cs=np.logspace(-4, 1, 6), cv=3, max_iter=3000, n_jobs=-1).fit(Z[train], y[train])
+                m = LogisticRegressionCV(Cs=np.logspace(-4, 1, 6), cv=3, max_iter=3000, n_jobs=1).fit(Z[train], y[train])
             except ValueError as e:  # too few examples of one class for 3-fold CV (small runs)
                 print(f"[probe] {f}: skipped ({e})")
                 res[f] = None
@@ -59,7 +76,7 @@ def fit_layer(X, labels, train, test, features):
         # Back to raw space: xi = w.(x-mu)/sd + b = (w/sd).x + (b - sum(w*mu/sd))
         W_raw = w / sd
         b_raw = b - float(np.sum(w * mu / sd))
-        res[f] = (float(score), W_raw.astype(np.float32), b_raw)
+        res[f] = (float(score), W_raw, b_raw)
     return res
 
 
@@ -68,6 +85,8 @@ def main():
     p.add_argument("--run", required=True, help="output dir of collect.py")
     p.add_argument("--test_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--jobs", type=int, default=0, help="parallel layers; 0 = half the CPUs")
+    p.add_argument("--scale", action="store_true", help="standardise each dimension before fitting")
     args = p.parse_args()
 
     run = Path(args.run)
@@ -84,12 +103,19 @@ def main():
     print(f"[probe] {train.sum()} train / {test.sum()} test frames ({len(test_eps)} held-out episodes)")
 
     scores = {f: [None] * L for f in features}
-    Ws = np.zeros((len(features), L, d), dtype=np.float32)
-    bs = np.zeros((len(features), L), dtype=np.float32)
+    Ws = np.zeros((len(features), L, d), dtype=np.float64)
+    bs = np.zeros((len(features), L), dtype=np.float64)
     t0 = time.time()
-    for l in range(L):
+    from joblib import Parallel, delayed
+
+    def one(l):
         X = np.load(run / f"acts_L{l:02d}.npy").astype(np.float32)
-        res = fit_layer(X, lab, train, test, features)
+        return l, fit_layer(X, lab, train, test, features, scale=args.scale)
+
+    n_jobs = args.jobs or max(1, min(L, (os.cpu_count() or 2) // 2))
+    print(f"[probe] fitting {L} layers with {n_jobs} parallel jobs", flush=True)
+    results = Parallel(n_jobs=n_jobs, verbose=5)(delayed(one)(l) for l in range(L))
+    for l, res in sorted(results, key=lambda t: t[0]):
         for fi, f in enumerate(features):
             if res[f] is not None:
                 scores[f][l], Ws[fi, l], bs[fi, l] = res[f]

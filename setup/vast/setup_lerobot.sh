@@ -6,7 +6,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/../.. && pwd)"
 cd "$REPO_ROOT"
-CONDA_DIR="${CONDA_DIR:-$HOME/miniconda3}"
+# shellcheck disable=SC1091
+source "$REPO_ROOT/setup/vast/_conda_env.sh"
 ENV_NAME=lerobot
 LEROBOT_VERSION=0.7.0
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
@@ -22,9 +23,7 @@ if [ ! -x "$CONDA_DIR/bin/conda" ]; then
   wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
   bash /tmp/miniconda.sh -b -p "$CONDA_DIR"
 fi
-export PATH="$CONDA_DIR/bin:$PATH"
-# shellcheck disable=SC1091
-source "$CONDA_DIR/etc/profile.d/conda.sh"
+load_conda
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
 
@@ -32,7 +31,7 @@ echo "=== [3/4] Conda env '$ENV_NAME' (python 3.12, lerobot==$LEROBOT_VERSION) =
 if ! conda env list | grep -qE "^$ENV_NAME\s"; then
   conda create -y -n "$ENV_NAME" python=3.12
 fi
-set +u; conda activate "$ENV_NAME"; set -u  # conda activate.d scripts are not nounset-safe
+activate_env "$ENV_NAME"
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 pip install "lerobot[pi,libero]==$LEROBOT_VERSION" scikit-learn matplotlib
 # Our code lives in src/: put it on sys.path (no reinstall of our package's deps needed).

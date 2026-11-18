@@ -128,8 +128,8 @@ class Probe:
     kind: str  # "regression" | "classification" (xi is the logit)
 
     def value(self, x: torch.Tensor) -> torch.Tensor:
-        W = torch.as_tensor(self.W, device=x.device, dtype=torch.float32)
-        return x.float() @ W + self.b
+        W = torch.as_tensor(self.W, device=x.device, dtype=torch.float64)
+        return x.double() @ W + self.b
 
 
 @dataclass
@@ -145,18 +145,20 @@ class Steer:
     alpha: float = 0.0
     xi_min: float = -np.inf
     xi_max: float = np.inf
+    margin: float = 0.0  # aim this far inside the interval (the paper's u lands exactly on the boundary)
     stats: dict = field(default_factory=lambda: {"calls": 0, "active": 0, "xi_before": [], "xi_after": [],
                                                  "u_norm": [], "x_norm": []})
 
     def delta(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, d) float32 pooled representation -> u: (B, d)."""
-        W = torch.as_tensor(self.probe.W, device=x.device, dtype=torch.float32)
+        W = torch.as_tensor(self.probe.W, device=x.device, dtype=torch.float64)
+        x = x.double()
         if self.mode == "fixed":
             # Scale relative to the representation norm so alpha means the same thing at every layer.
-            return (self.alpha * x.norm(dim=1, keepdim=True)) * (W / W.norm())[None, :]
+            return ((self.alpha * x.norm(dim=1, keepdim=True)) * (W / W.norm())[None, :]).float()
         xi = x @ W + self.probe.b
-        target = torch.clamp(xi, min=self.xi_min, max=self.xi_max)
-        return ((target - xi) / (W @ W))[:, None] * W[None, :]
+        target = torch.clamp(xi, min=self.xi_min + self.margin, max=self.xi_max - self.margin)
+        return (((target - xi) / (W @ W))[:, None] * W[None, :]).float()
 
 
 class PrefixSteer:
